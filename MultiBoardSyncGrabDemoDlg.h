@@ -75,6 +75,42 @@ protected:
    SapTransfer*      m_Xfer[2];
    SapView*          m_View;
 
+   // 线程同步与控制
+   HANDLE      m_hWorkerThread[2];       // 两个后台写盘线程
+   HANDLE      m_hStopEvent[2];          // 两个停止信号
+   HANDLE      m_hDataAvailableEvent[2]; // 两个数据就绪信号
+   CRITICAL_SECTION m_csPool[2];         // 两把锁，分别保护各自的内存池
+
+   // 内存池
+   BYTE** m_pMemPool[2];            // 两个指针数组，指向各自的内存块
+   int         m_iHead[2];               // 生产者指针
+   int         m_iTail[2];               // 消费者指针
+   int         m_nPoolLoad[2];           // 当前积压量
+
+   // 文件操作
+   HANDLE      m_hFileRaw[2];            // 两个文件句柄 (直写模式)
+   BOOL        m_bIsRecording;           // 全局录制状态
+   int         m_nFramesRecorded[2];     // 各自已录制的帧数
+   int         m_nChunkIndex[2];         // 各自的分卷索引
+   int         m_nFramesInCurrentChunk[2];// 当前分卷已写帧数
+
+   // 路径管理
+   CString     m_strBasePath[2];         // 两个相机的基础路径 (例如 "D:\Cam1" 和 "E:\Cam2")
+   CString     m_strLogPath;             // 日志路径
+
+   // 常量定义
+   static const int POOL_FRAME_COUNT = 500; // 每个相机 500 帧缓冲
+   static const int CHUNK_FRAME_LIMIT = 8500; // 分卷大小
+
+   // 线程函数
+   static DWORD WINAPI WriteThreadEntry0(LPVOID pParam);
+   static DWORD WINAPI WriteThreadEntry1(LPVOID pParam);
+   void WriteThreadLoop(int camIndex); // 通用写盘逻辑
+
+   // 辅助函数
+   void WriteTrashLog(int camIndex, int trashCount, int currentFrame);
+   void CleanupResources(); // 统一清理
+
 	
    BOOL m_IsSignalDetected;   // TRUE if camera signal is detected
 

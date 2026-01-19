@@ -78,6 +78,22 @@ CMultiBoardSyncGrabDemoDlg::CMultiBoardSyncGrabDemoDlg(CWnd* pParent /*=NULL*/)
 	m_View            = NULL;
 
    m_IsSignalDetected = TRUE;
+
+   // 【新增初始化】
+   m_bIsRecording = FALSE;
+   for (int i = 0; i < 2; i++)
+   {
+	   m_hWorkerThread[i] = NULL;
+	   m_hStopEvent[i] = NULL;
+	   m_hDataAvailableEvent[i] = NULL;
+	   m_pMemPool[i] = NULL;
+	   m_hFileRaw[i] = INVALID_HANDLE_VALUE;
+	   m_iHead[i] = 0;
+	   m_iTail[i] = 0;
+	   m_nPoolLoad[i] = 0;
+	   m_nFramesRecorded[i] = 0;
+	   InitializeCriticalSection(&m_csPool[i]); // 初始化锁
+   }
 }
 
 void CMultiBoardSyncGrabDemoDlg::DoDataExchange(CDataExchange* pDX)
@@ -116,25 +132,60 @@ END_MESSAGE_MAP()
 /////////////////////////////////////////////////////////////////////////////
 // CMultiBoardSyncGrabDemoDlg message handlers
 
-void CMultiBoardSyncGrabDemoDlg::XferCallback(SapXferCallbackInfo *pInfo)
+void CMultiBoardSyncGrabDemoDlg::XferCallback(SapXferCallbackInfo* pInfo)
 {
-	CMultiBoardSyncGrabDemoDlg *pDlg= (CMultiBoardSyncGrabDemoDlg *) pInfo->GetContext();
+	CMultiBoardSyncGrabDemoDlg* pDlg = (CMultiBoardSyncGrabDemoDlg*)pInfo->GetContext();
 
-   // If grabbing in trash buffer, do not display the image, update the
-   // appropriate number of frames on the status bar instead
-   if (pInfo->IsTrash())
-   {
-      CString str;
-      str.Format(_T("Frames acquired in trash buffer: %d"), pInfo->GetEventCount());
-      pDlg->m_statusWnd.SetWindowText(str);
-   }
+	// 1. 判断是哪个相机触发的回调
+	int camIndex = -1;
+	if (pInfo->GetTransfer() == pDlg->m_Xfer[0]) camIndex = 0;
+	else if (pInfo->GetTransfer() == pDlg->m_Xfer[1]) camIndex = 1;
+	else return; // 异常情况
 
-   // Refresh view
-   else
-   {
-      pDlg->m_View->Show();
-      pDlg->UpdateTitleBar();
-   }
+	if (pInfo->IsTrash())
+	{
+		// 记录丢帧日志
+		pDlg->WriteTrashLog(camIndex, -1, pDlg->m_nFramesRecorded[camIndex]);
+		return;
+	}
+
+	// 2. 如果正在录制，将数据拷贝到对应的内存池
+	if (pDlg->m_bIsRecording)
+	{
+		EnterCriticalSection(&pDlg->m_csPool[camIndex]);
+		if (pDlg->m_nPoolLoad[camIndex] < POOL_FRAME_COUNT)
+		{
+			void* pSrc = NULL;
+			// 注意：m_Buffers[camIndex] 是 SapBufferRoi，需要正确获取地址
+			pDlg->m_Buffers[camIndex]->GetAddress(pDlg->m_Buffers[camIndex]->GetIndex(), &pSrc);
+
+			int width = pDlg->m_Buffers[camIndex]->GetWidth();
+			int height = pDlg->m_Buffers[camIndex]->GetHeight();
+			int size = width * height; // 假设 8-bit，如果是 10/12-bit 需要乘字节数
+
+			// 拷贝数据
+			memcpy(pDlg->m_pMemPool[camIndex][pDlg->m_iHead[camIndex]], pSrc, size);
+
+			pDlg->m_iHead[camIndex] = (pDlg->m_iHead[camIndex] + 1) % POOL_FRAME_COUNT;
+			pDlg->m_nPoolLoad[camIndex]++;
+
+			// 唤醒对应的写盘线程
+			SetEvent(pDlg->m_hDataAvailableEvent[camIndex]);
+		}
+		else
+		{
+			// 内存池满，软丢帧
+			pDlg->WriteTrashLog(camIndex, -2, pDlg->m_nFramesRecorded[camIndex]);
+		}
+		LeaveCriticalSection(&pDlg->m_csPool[camIndex]);
+	}
+
+	// 3. 刷新界面 (可选：只刷新相机0的图像，或者交替刷新，避免界面卡顿)
+	// if (camIndex == 0) 
+	{
+		pDlg->m_View->Show();
+		// ...
+	}
 }
 
 void CMultiBoardSyncGrabDemoDlg::SignalCallback(SapAcqCallbackInfo *pInfo)
@@ -279,6 +330,25 @@ BOOL CMultiBoardSyncGrabDemoDlg::OnInitDialog()
 
    // Get current input signal connection status
    GetSignalStatus();
+
+   // 【新增】为两个相机申请内存池
+   for (int i = 0; i < 2; i++)
+   {
+	   if (m_Buffers[i] && *m_Buffers[i])
+	   {
+		   int width = m_Buffers[i]->GetWidth();
+		   int height = m_Buffers[i]->GetHeight();
+		   int bytesPerPixel = m_Buffers[i]->GetBytesPerPixel();
+		   int frameSize = width * height * bytesPerPixel;
+
+		   m_pMemPool[i] = new BYTE * [POOL_FRAME_COUNT];
+		   for (int j = 0; j < POOL_FRAME_COUNT; j++)
+		   {
+			   // 4KB 对齐，满足 SSD 直写要求
+			   m_pMemPool[i][j] = (BYTE*)VirtualAlloc(NULL, frameSize, MEM_COMMIT, PAGE_READWRITE);
+		   }
+	   }
+   }
 
 	return TRUE;  // return TRUE  unless you set the focus to a control
 }
@@ -583,26 +653,96 @@ void CMultiBoardSyncGrabDemoDlg::UpdateTitleBar()
 //
 //*****************************************************************************************
 
-void CMultiBoardSyncGrabDemoDlg::OnFreeze( ) 
+void CMultiBoardSyncGrabDemoDlg::OnFreeze()
 {
-	if( m_Xfer[0]->Freeze() && m_Xfer[1]->Freeze())
+	// 1. 硬件停止
+	if (m_Xfer[0]->Freeze() && m_Xfer[1]->Freeze())
 	{
-		if (CAbortDlg(this, m_Xfer[0]).DoModal() != IDOK) 
-			m_Xfer[0]->Abort();
-      if (CAbortDlg(this, m_Xfer[1]).DoModal() != IDOK) 
-			m_Xfer[1]->Abort();
-
+		if (CAbortDlg(this, m_Xfer[0]).DoModal() != IDOK) m_Xfer[0]->Abort();
+		if (CAbortDlg(this, m_Xfer[1]).DoModal() != IDOK) m_Xfer[1]->Abort();
 		UpdateMenu();
+	}
+
+	// 2. 软件停止录制
+	if (m_bIsRecording)
+	{
+		m_bIsRecording = FALSE; // 关闸
+
+		for (int i = 0; i < 2; i++)
+		{
+			// 发送停止信号
+			if (m_hStopEvent[i]) SetEvent(m_hStopEvent[i]);
+			if (m_hDataAvailableEvent[i]) SetEvent(m_hDataAvailableEvent[i]);
+
+			// 等待线程结束
+			if (m_hWorkerThread[i]) {
+				WaitForSingleObject(m_hWorkerThread[i], 3000);
+				CloseHandle(m_hWorkerThread[i]); m_hWorkerThread[i] = NULL;
+			}
+
+			// 关闭文件
+			if (m_hFileRaw[i] != INVALID_HANDLE_VALUE) {
+				CloseHandle(m_hFileRaw[i]); m_hFileRaw[i] = INVALID_HANDLE_VALUE;
+			}
+
+			// 清理句柄
+			if (m_hStopEvent[i]) { CloseHandle(m_hStopEvent[i]); m_hStopEvent[i] = NULL; }
+			if (m_hDataAvailableEvent[i]) { CloseHandle(m_hDataAvailableEvent[i]); m_hDataAvailableEvent[i] = NULL; }
+		}
+
+		CString strMsg;
+		strMsg.Format(_T("录制结束！\n相机1: %d 帧\n相机2: %d 帧"), m_nFramesRecorded[0], m_nFramesRecorded[1]);
+		AfxMessageBox(strMsg);
 	}
 }
 
-void CMultiBoardSyncGrabDemoDlg::OnGrab() 
+void CMultiBoardSyncGrabDemoDlg::OnGrab()
 {
-   m_statusWnd.SetWindowText(_T(""));
+	m_statusWnd.SetWindowText(_T(""));
 
-	if( m_Xfer[0]->Grab() && m_Xfer[1]->Grab())
+	// 1. 弹出两次对话框，分别选择两个相机的保存路径
+	CFileDialog dlg1(FALSE, _T(".raw"), _T("Cam1_Data.raw"), OFN_HIDEREADONLY | OFN_OVERWRITEPROMPT, _T("Raw Files|*.raw||"));
+	dlg1.m_ofn.lpstrTitle = _T("请选择【相机 1】保存路径 (建议 D盘)");
+	if (dlg1.DoModal() != IDOK) return;
+	m_strBasePath[0] = dlg1.GetPathName();
+	// 去掉后缀，只保留前缀
+	m_strBasePath[0] = m_strBasePath[0].Left(m_strBasePath[0].ReverseFind('.'));
+
+	CFileDialog dlg2(FALSE, _T(".raw"), _T("Cam2_Data.raw"), OFN_HIDEREADONLY | OFN_OVERWRITEPROMPT, _T("Raw Files|*.raw||"));
+	dlg2.m_ofn.lpstrTitle = _T("请选择【相机 2】保存路径 (建议 E盘)");
+	if (dlg2.DoModal() != IDOK) return;
+	m_strBasePath[1] = dlg2.GetPathName();
+	m_strBasePath[1] = m_strBasePath[1].Left(m_strBasePath[1].ReverseFind('.'));
+	m_strLogPath = m_strBasePath[0] + _T("_Log.txt");
+
+	// 2. 初始化所有状态
+	m_bIsRecording = TRUE;
+	for (int i = 0; i < 2; i++)
 	{
-		UpdateMenu();	
+		m_nChunkIndex[i] = 0;
+		m_nFramesRecorded[i] = 0;
+		m_nFramesInCurrentChunk[i] = 0;
+		m_iHead[i] = 0; m_iTail[i] = 0; m_nPoolLoad[i] = 0;
+
+		// 创建第一个文件
+		CString fileName;
+		fileName.Format(_T("%s_Part0000.raw"), m_strBasePath[i]);
+		m_hFileRaw[i] = CreateFile(fileName, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING, NULL);
+
+		// 创建事件和线程
+		m_hStopEvent[i] = CreateEvent(NULL, TRUE, FALSE, NULL);
+		m_hDataAvailableEvent[i] = CreateEvent(NULL, FALSE, FALSE, NULL);
+
+		if (i == 0) m_hWorkerThread[i] = CreateThread(NULL, 0, WriteThreadEntry0, this, 0, NULL);
+		else        m_hWorkerThread[i] = CreateThread(NULL, 0, WriteThreadEntry1, this, 0, NULL);
+	}
+
+	// 3. 启动双相机采集
+	if (m_Xfer[0]->Grab() && m_Xfer[1]->Grab())
+	{
+		UpdateMenu();
+		m_statusWnd.SetWindowText(_T("双相机同步录制中..."));
 	}
 }
 
@@ -631,6 +771,70 @@ void CMultiBoardSyncGrabDemoDlg::OnViewOptions()
 	{
 		m_ImageWnd->Invalidate();
 		m_ImageWnd->OnSize();
+	}
+}
+
+// 线程入口
+DWORD WINAPI CMultiBoardSyncGrabDemoDlg::WriteThreadEntry0(LPVOID pParam) {
+	((CMultiBoardSyncGrabDemoDlg*)pParam)->WriteThreadLoop(0); return 0;
+}
+DWORD WINAPI CMultiBoardSyncGrabDemoDlg::WriteThreadEntry1(LPVOID pParam) {
+	((CMultiBoardSyncGrabDemoDlg*)pParam)->WriteThreadLoop(1); return 0;
+}
+
+// 通用写盘循环
+void CMultiBoardSyncGrabDemoDlg::WriteThreadLoop(int camIndex)
+{
+	int width = m_Buffers[camIndex]->GetWidth();
+	int height = m_Buffers[camIndex]->GetHeight();
+	int frameSize = width * height; // 8-bit
+	DWORD dwWritten;
+
+	while (WaitForSingleObject(m_hStopEvent[camIndex], 0) != WAIT_OBJECT_0)
+	{
+		// 等待数据
+		WaitForSingleObject(m_hDataAvailableEvent[camIndex], 1000);
+
+		while (true)
+		{
+			BYTE* pData = NULL;
+
+			// 取数据
+			EnterCriticalSection(&m_csPool[camIndex]);
+			if (m_nPoolLoad[camIndex] > 0) {
+				pData = m_pMemPool[camIndex][m_iTail[camIndex]];
+			}
+			LeaveCriticalSection(&m_csPool[camIndex]);
+
+			if (pData == NULL) break;
+
+			// 写盘 (直写)
+			if (!WriteFile(m_hFileRaw[camIndex], pData, frameSize, &dwWritten, NULL)) {
+				// 错误处理...
+			}
+
+			// 更新指针
+			EnterCriticalSection(&m_csPool[camIndex]);
+			m_iTail[camIndex] = (m_iTail[camIndex] + 1) % POOL_FRAME_COUNT;
+			m_nPoolLoad[camIndex]--;
+			m_nFramesRecorded[camIndex]++;
+			m_nFramesInCurrentChunk[camIndex]++;
+			LeaveCriticalSection(&m_csPool[camIndex]);
+
+			// 分卷逻辑
+			if (m_nFramesInCurrentChunk[camIndex] >= CHUNK_FRAME_LIMIT)
+			{
+				CloseHandle(m_hFileRaw[camIndex]);
+				m_nChunkIndex[camIndex]++;
+				m_nFramesInCurrentChunk[camIndex] = 0;
+
+				CString nextFile;
+				nextFile.Format(_T("%s_Part%04d.raw"), m_strBasePath[camIndex], m_nChunkIndex[camIndex]);
+
+				m_hFileRaw[camIndex] = CreateFile(nextFile, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+					FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING, NULL);
+			}
+		}
 	}
 }
 
@@ -673,3 +877,30 @@ void CMultiBoardSyncGrabDemoDlg::GetSignalStatus(SapAcquisition::SignalStatus si
    }
 }
 
+// =========================================================
+// 【补全】双相机丢帧日志记录函数
+// =========================================================
+void CMultiBoardSyncGrabDemoDlg::WriteTrashLog(int camIndex, int trashCount, int currentFrame)
+{
+	// 如果没有设置日志路径，直接返回
+	if (m_strLogPath.IsEmpty()) return;
+
+	// 以追加模式(a+)打开日志文件
+	FILE* fp = _tfopen(m_strLogPath, _T("a+"));
+	if (fp)
+	{
+		// 获取当前时间
+		SYSTEMTIME st;
+		GetLocalTime(&st);
+
+		// 区分是哪个相机报的警
+		CString strCam = (camIndex == 0) ? _T("Camera_1") : _T("Camera_2");
+
+		// 写入日志: [时间] [相机号] 丢帧信息
+		_ftprintf(fp, _T("[%02d:%02d:%02d.%03d] [%s] 丢帧警告! 发生在第 %d 帧. Trash堆积: %d\n"),
+			st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+			strCam, currentFrame, trashCount);
+
+		fclose(fp);
+	}
+}
