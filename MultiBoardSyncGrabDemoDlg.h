@@ -100,7 +100,7 @@ protected:
 
    // 常量定义
    static const int POOL_FRAME_COUNT = 500; // 每个相机 500 帧缓冲
-   static const int CHUNK_FRAME_LIMIT = 8500; // 分卷大小
+   static const int CHUNK_FRAME_LIMIT = 4000; // 分卷大小
 
    // 线程函数
    static DWORD WINAPI WriteThreadEntry0(LPVOID pParam);

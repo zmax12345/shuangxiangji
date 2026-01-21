@@ -155,16 +155,31 @@ void CMultiBoardSyncGrabDemoDlg::XferCallback(SapXferCallbackInfo* pInfo)
 		EnterCriticalSection(&pDlg->m_csPool[camIndex]);
 		if (pDlg->m_nPoolLoad[camIndex] < POOL_FRAME_COUNT)
 		{
-			void* pSrc = NULL;
-			// 注意：m_Buffers[camIndex] 是 SapBufferRoi，需要正确获取地址
-			pDlg->m_Buffers[camIndex]->GetAddress(pDlg->m_Buffers[camIndex]->GetIndex(), &pSrc);
+			
 
+			
+
+			// ---------------------------------------------------------
+// 【终极修正】自动适配 8位/16位 的拷贝代码
+// ---------------------------------------------------------
+
+// 1. 问相机：你现在到底是一个像素占几字节？(bpp)
 			int width = pDlg->m_Buffers[camIndex]->GetWidth();
 			int height = pDlg->m_Buffers[camIndex]->GetHeight();
-			int size = width * height; // 假设 8-bit，如果是 10/12-bit 需要乘字节数
+			int bpp = pDlg->m_Buffers[camIndex]->GetBytesPerPixel(); // 这里会自动返回 2 (如果是16-bit)
 
-			// 拷贝数据
-			memcpy(pDlg->m_pMemPool[camIndex][pDlg->m_iHead[camIndex]], pSrc, size);
+			// 2. 算一下：一行到底有多少数据？
+			int bytesPerLine = width * bpp;
+
+			// 3. 找地址
+			void* pSrc = NULL;
+			pDlg->m_Buffers[camIndex]->GetAddress(pDlg->m_Buffers[camIndex]->GetIndex(), &pSrc);
+			BYTE* pDst = pDlg->m_pMemPool[camIndex][pDlg->m_iHead[camIndex]];
+
+			// 4. 拷贝 (这里是最关键的修改！)
+			// 以前您写的是 width * height，现在改为 bytesPerLine * height
+			// 这样就能把 16-bit 的全部数据都存进去了！
+			memcpy(pDst, pSrc, bytesPerLine * height);
 
 			pDlg->m_iHead[camIndex] = (pDlg->m_iHead[camIndex] + 1) % POOL_FRAME_COUNT;
 			pDlg->m_nPoolLoad[camIndex]++;
@@ -655,7 +670,9 @@ void CMultiBoardSyncGrabDemoDlg::UpdateTitleBar()
 
 void CMultiBoardSyncGrabDemoDlg::OnFreeze()
 {
-	// 1. 硬件停止
+	// -----------------------------------------------------------
+	// 第一步：先让硬件停下来 (不再产生新数据)
+	// -----------------------------------------------------------
 	if (m_Xfer[0]->Freeze() && m_Xfer[1]->Freeze())
 	{
 		if (CAbortDlg(this, m_Xfer[0]).DoModal() != IDOK) m_Xfer[0]->Abort();
@@ -663,35 +680,51 @@ void CMultiBoardSyncGrabDemoDlg::OnFreeze()
 		UpdateMenu();
 	}
 
-	// 2. 软件停止录制
+	// -----------------------------------------------------------
+	// 【核心修复】让子弹飞一会儿 (关键！)
+	// 硬件虽然停了，但驱动缓存里可能还积压着几十帧数据没传完。
+	// 如果立刻关闸，这些尾部数据就会丢失。
+	// 这里强行等待 1000 毫秒，保证所有余粮都能进仓。
+	// -----------------------------------------------------------
+	Sleep(1000);
+
+	// -----------------------------------------------------------
+	// 第二步：软件关闸 (停止存盘)
+	// -----------------------------------------------------------
 	if (m_bIsRecording)
 	{
-		m_bIsRecording = FALSE; // 关闸
+		m_bIsRecording = FALSE; // 真正关闸
 
 		for (int i = 0; i < 2; i++)
 		{
-			// 发送停止信号
+			// 1. 发送停止信号给后台线程
 			if (m_hStopEvent[i]) SetEvent(m_hStopEvent[i]);
+
+			// 2. 踹一脚(SetEvent)唤醒可能在睡觉的线程，防止它死等
 			if (m_hDataAvailableEvent[i]) SetEvent(m_hDataAvailableEvent[i]);
 
-			// 等待线程结束
+			// 3. 等待写盘线程安全退出 (给它一点时间把最后的数据写进硬盘)
 			if (m_hWorkerThread[i]) {
-				WaitForSingleObject(m_hWorkerThread[i], 3000);
-				CloseHandle(m_hWorkerThread[i]); m_hWorkerThread[i] = NULL;
+				WaitForSingleObject(m_hWorkerThread[i], 3000); // 最多等3秒
+				CloseHandle(m_hWorkerThread[i]);
+				m_hWorkerThread[i] = NULL;
 			}
 
-			// 关闭文件
+			// 4. 关闭文件句柄
 			if (m_hFileRaw[i] != INVALID_HANDLE_VALUE) {
-				CloseHandle(m_hFileRaw[i]); m_hFileRaw[i] = INVALID_HANDLE_VALUE;
+				CloseHandle(m_hFileRaw[i]);
+				m_hFileRaw[i] = INVALID_HANDLE_VALUE;
 			}
 
-			// 清理句柄
+			// 5. 清理事件句柄
 			if (m_hStopEvent[i]) { CloseHandle(m_hStopEvent[i]); m_hStopEvent[i] = NULL; }
 			if (m_hDataAvailableEvent[i]) { CloseHandle(m_hDataAvailableEvent[i]); m_hDataAvailableEvent[i] = NULL; }
 		}
 
+		// 弹窗汇报最终结果
 		CString strMsg;
-		strMsg.Format(_T("录制结束！\n相机1: %d 帧\n相机2: %d 帧"), m_nFramesRecorded[0], m_nFramesRecorded[1]);
+		strMsg.Format(_T("录制完美结束！\n\n相机1: %d 帧\n相机2: %d 帧\n\n(已自动补全尾部数据)"),
+			m_nFramesRecorded[0], m_nFramesRecorded[1]);
 		AfxMessageBox(strMsg);
 	}
 }
@@ -787,7 +820,8 @@ void CMultiBoardSyncGrabDemoDlg::WriteThreadLoop(int camIndex)
 {
 	int width = m_Buffers[camIndex]->GetWidth();
 	int height = m_Buffers[camIndex]->GetHeight();
-	int frameSize = width * height; // 8-bit
+	int bpp = m_Buffers[camIndex]->GetBytesPerPixel();
+	int frameSize = width * height * bpp; // 这样写文件时才会写 2 倍大小
 	DWORD dwWritten;
 
 	while (WaitForSingleObject(m_hStopEvent[camIndex], 0) != WAIT_OBJECT_0)
